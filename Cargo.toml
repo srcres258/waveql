@@ -1,6 +1,16 @@
 [package]
 name = "waveql"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A high-performance VCD/FST waveform query CLI for AI Agents and humans"
+license = "MIT"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vcd = "0.6"
+wellen = "0.20"
+thiserror = "2"
+anyhow = "1"
+unicode-width = "0.2"

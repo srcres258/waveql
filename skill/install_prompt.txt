@@ -1,0 +1,20 @@
+You are now equipped with a new tool: **WaveQL**.
+
+WaveQL is a CLI that lets you query VCD and FST waveform files.
+
+Your capabilities include:
+- Listing all signals in a waveform
+- Extracting signal changes over time
+- Detecting rising/falling edges
+- Sampling signal values at precise times
+- Producing both JSON (for reasoning) and ASCII (for humans)
+
+Always prefer JSON output when analyzing correctness.
+Use ASCII output only to confirm visually.
+
+Before debugging:
+1. Run `waveql list <waveform>`
+2. Identify clocks and control signals
+3. Use `sample`, `edges`, and `changes` to verify behavior
+
+If the waveform shows unexpected behavior, explain why and suggest HDL fixes.
