@@ -2,7 +2,7 @@ use crate::error::WaveqlError;
 use crate::query::{
     ChangeEvent, ChangesOutput, EdgesOutput, EdgeType, ListOutput, RangeInfo, SampleOutput,
 };
-use crate::{Query, Waveform};
+use crate::{CompactValue, Query, Waveform};
 
 /// Evaluate a query against a loaded waveform.
 pub fn evaluate(
@@ -39,7 +39,7 @@ fn evaluate_changes(
     signals: &[String],
     range: crate::query::TimeRange,
 ) -> Result<String, WaveqlError> {
-    let resolved = resolve_signals(waveform, signals)?;
+    let resolved = waveform.resolve_signals(signals)?;
     let mut events: Vec<ChangeEvent> = Vec::new();
 
     let from = range.from.unwrap_or(0);
@@ -52,7 +52,7 @@ fn evaluate_changes(
                     events.push(ChangeEvent {
                         time: *t,
                         signal: sig.clone(),
-                        value: v.clone(),
+                        value: v.as_str().to_string(),
                     });
                 }
             }
@@ -87,7 +87,7 @@ fn evaluate_edges(
     let from = range.from.unwrap_or(0);
     let to = range.to.unwrap_or(u64::MAX);
 
-    let filtered: Vec<&(u64, String)> = data
+    let filtered: Vec<&(u64, CompactValue)> = data
         .changes
         .iter()
         .skip_while(|(t, _)| *t < from)
@@ -101,8 +101,8 @@ fn evaluate_edges(
         let curr_val = &filtered[i].1;
         let time = filtered[i].0;
 
-        let prev_high = is_high(prev_val);
-        let curr_high = is_high(curr_val);
+        let prev_high = prev_val.is_high();
+        let curr_high = curr_val.is_high();
 
         match edge_type {
             EdgeType::Rising => {
@@ -148,7 +148,7 @@ fn evaluate_sample(
         .get(signal)
         .ok_or_else(|| WaveqlError::SignalNotFound(signal.to_string()))?;
 
-    let value = data.sample(at).map(|s| s.to_string());
+    let value = data.sample(at).map(|cv| cv.as_str().to_string());
 
     let output = SampleOutput {
         signal: signal.to_string(),
@@ -163,7 +163,7 @@ fn evaluate_ascii(
     signals: &[String],
     range: crate::query::TimeRange,
 ) -> Result<String, WaveqlError> {
-    let resolved = resolve_signals(waveform, signals)?;
+    let resolved = waveform.resolve_signals(signals)?;
 
     let from = range.from.unwrap_or(0);
     let to = range.to.unwrap_or(u64::MAX);
@@ -215,7 +215,7 @@ fn evaluate_ascii(
                     .data
                     .get(sig)
                     .and_then(|d| d.sample(t))
-                    .map(|v| format_sig_value(v))
+                    .map(|v| v.format_ascii())
                     .unwrap_or_else(|| "??".to_string())
             })
             .collect();
@@ -239,78 +239,4 @@ fn evaluate_ascii(
     Ok(output)
 }
 
-// ── Signal Resolution ────────────────────────────────────────────
 
-fn is_high(value: &str) -> bool {
-    if value == "1" {
-        return true;
-    }
-    if value == "0" {
-        return false;
-    }
-    // Multi-bit: treat as high if contains any '1' or non-zero hex
-    for c in value.chars() {
-        match c {
-            '1'..='9' | 'A'..='F' | 'a'..='f' => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-fn resolve_signals(waveform: &Waveform, patterns: &[String]) -> Result<Vec<String>, WaveqlError> {
-    if patterns.is_empty() {
-        return Ok(waveform.signals.iter().map(|s| s.path.clone()).collect());
-    }
-
-    let mut result = Vec::new();
-    for pattern in patterns {
-        let matched = wildcard_match(&waveform.signals, pattern);
-        if matched.is_empty() {
-            return Err(WaveqlError::SignalNotFound(pattern.clone()));
-        }
-        result.extend(matched);
-    }
-    let mut seen = std::collections::HashSet::new();
-    result.retain(|s| seen.insert(s.clone()));
-    Ok(result)
-}
-
-fn wildcard_match(signals: &[crate::SignalInfo], pattern: &str) -> Vec<String> {
-    if !pattern.contains('*') {
-        if signals.iter().any(|s| s.path == pattern) {
-            return vec![pattern.to_string()];
-        }
-        return vec![];
-    }
-
-    let (prefix, suffix) = if let Some(pos) = pattern.find('*') {
-        (&pattern[..pos], &pattern[pos + 1..])
-    } else {
-        (pattern, "")
-    };
-
-    signals
-        .iter()
-        .filter(|s| s.path.starts_with(prefix) && s.path.ends_with(suffix))
-        .map(|s| s.path.clone())
-        .collect()
-}
-
-fn format_sig_value(value: &str) -> String {
-    // Convert 1-bit values to block characters for ASCII view
-    match value {
-        "0" => "░".to_string(),
-        "1" => "█".to_string(),
-        "X" | "x" => "╳".to_string(),
-        "Z" | "z" => "Z".to_string(),
-        _ => {
-            // Truncate long values
-            if value.len() > 8 {
-                format!("{}..", &value[..6])
-            } else {
-                value.to_string()
-            }
-        }
-    }
-}

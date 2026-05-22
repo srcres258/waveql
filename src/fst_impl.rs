@@ -1,22 +1,15 @@
 use crate::error::WaveqlError;
-use crate::{FileFormat, SignalData, SignalInfo, TimeUnit, Timescale, Waveform};
+use crate::{
+    CompactValue, FileFormat, LazyLoader, SignalInfo, TimeUnit, Timescale, Waveform,
+};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 pub fn parse_fst(file_path: &str) -> Result<Waveform, WaveqlError> {
-    let mut waves = wellen::simple::read(file_path)?;
+    let waves = wellen::simple::read(file_path)?;
 
-    // Step 1: Collect signal refs (immutable borrow of waves)
-    let sig_refs: Vec<wellen::SignalRef> = {
-        let hierarchy = waves.hierarchy();
-        hierarchy.iter_vars().map(|v| v.signal_ref()).collect()
-    };
-
-    // Step 2: Load signals (mutable borrow)
-    waves.load_signals(&sig_refs);
-
-    // Step 3: Extract data (immutable borrow again)
     let hierarchy = waves.hierarchy();
-    let time_table = waves.time_table();
+    let time_table = waves.time_table().to_vec();
 
     let timescale = hierarchy
         .timescale()
@@ -27,27 +20,15 @@ pub fn parse_fst(file_path: &str) -> Result<Waveform, WaveqlError> {
         .unwrap_or_default();
 
     let mut signals: Vec<SignalInfo> = Vec::new();
-    let mut data: HashMap<String, SignalData> = HashMap::new();
+    let mut sig_refs: HashMap<String, wellen::SignalRef> = HashMap::new();
 
     for var in hierarchy.iter_vars() {
-        let path = var.full_name(&hierarchy);
+        let path = var.full_name(hierarchy);
         let width = var.length().unwrap_or(1);
-
-        signals.push(SignalInfo {
-            path: path.clone(),
-            width,
-        });
-
         let sig_ref = var.signal_ref();
-        if let Some(signal) = waves.get_signal(sig_ref) {
-            let mut changes: Vec<(u64, String)> = Vec::new();
-            for (time_idx, val) in signal.iter_changes() {
-                let time = time_table[time_idx as usize];
-                let val_str = format_signal_value(&val);
-                changes.push((time, val_str));
-            }
-            data.insert(path, SignalData { changes });
-        }
+
+        sig_refs.insert(path.clone(), sig_ref);
+        signals.push(SignalInfo { path, width });
     }
 
     signals.sort_by(|a, b| a.path.cmp(&b.path));
@@ -55,8 +36,13 @@ pub fn parse_fst(file_path: &str) -> Result<Waveform, WaveqlError> {
     Ok(Waveform {
         timescale,
         signals,
-        data,
+        data: HashMap::new(),
         file_format: FileFormat::Fst,
+        lazy: Some(LazyLoader::Fst {
+            waves: Box::new(RefCell::new(waves)),
+            time_table,
+            sig_refs,
+        }),
     })
 }
 
@@ -72,15 +58,15 @@ fn convert_wellen_timeunit(unit: &wellen::TimescaleUnit) -> TimeUnit {
     }
 }
 
-fn format_signal_value(val: &wellen::SignalValue) -> String {
+pub(crate) fn format_signal_value(val: &wellen::SignalValue) -> CompactValue {
     if val.is_event() {
-        return "EVENT".to_string();
+        return CompactValue::new("EVENT");
     }
     if let Some(bit_str) = val.to_bit_string() {
-        return bit_str;
+        return CompactValue::new(&bit_str);
     }
     if let Some(bits) = val.bits() {
-        return format!("{:X}", bits);
+        return CompactValue::new(&format!("{:X}", bits));
     }
-    "?".to_string()
+    CompactValue::Bit(b'?')
 }

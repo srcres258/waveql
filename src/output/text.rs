@@ -51,7 +51,7 @@ fn render_sample_text(
         .data
         .get(signal)
         .ok_or_else(|| WaveqlError::SignalNotFound(signal.to_string()))?;
-    let value = data.sample(at).unwrap_or("(unknown)");
+    let value = data.sample(at).map(|cv| cv.as_str()).unwrap_or("(unknown)");
     Ok(format!(
         "Signal: {}\nAt: {}\nValue: {}\n",
         signal, at, value

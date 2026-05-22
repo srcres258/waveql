@@ -38,7 +38,7 @@ fn render_sample_table(
         .data
         .get(signal)
         .ok_or_else(|| WaveqlError::SignalNotFound(signal.to_string()))?;
-    let value = data.sample(at).unwrap_or("?");
+    let value = data.sample(at).map(|cv| cv.as_str()).unwrap_or("?");
     Ok(format!("{}|{}|{}\n", signal, at, value))
 }
 

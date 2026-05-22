@@ -1,5 +1,7 @@
 use crate::error::WaveqlError;
-use crate::{FileFormat, SignalData, SignalInfo, Timescale, TimeUnit, Waveform};
+use crate::{
+    CompactValue, FileFormat, LazyLoader, SignalData, SignalInfo, Timescale, TimeUnit, Waveform,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -11,9 +13,8 @@ pub fn parse_vcd(file_path: &str) -> Result<Waveform, WaveqlError> {
 
     let mut timescale = Timescale::default();
     let mut scope_stack: Vec<String> = Vec::new();
-    let mut signal_map: HashMap<String, SignalInfo> = HashMap::new(); // id_code -> info
-    let mut signal_changes: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-    let mut current_time: u64 = 0;
+    let mut signal_map: HashMap<String, SignalInfo> = HashMap::new();
+    let mut id_codes: HashMap<String, String> = HashMap::new();
 
     loop {
         let cmd = match parser.next() {
@@ -47,56 +48,85 @@ pub fn parse_vcd(file_path: &str) -> Result<Waveform, WaveqlError> {
                         width: size,
                     },
                 );
-                signal_changes.entry(path).or_default();
+                id_codes.insert(code_str, path);
             }
-            vcd::Command::Timestamp(time) => {
-                current_time = time;
+            vcd::Command::Enddefinitions => {
+                break;
             }
-            vcd::Command::ChangeScalar(code, value) => {
-                let code_str = code.to_string();
-                if let Some(info) = signal_map.get(&code_str) {
-                    let val_str = match &value {
-                        vcd::Value::V0 => "0",
-                        vcd::Value::V1 => "1",
-                        vcd::Value::X => "X",
-                        vcd::Value::Z => "Z",
-                    };
-                    if let Some(changes) = signal_changes.get_mut(&info.path) {
-                        changes.push((current_time, val_str.to_string()));
-                    }
-                }
-            }
-            vcd::Command::ChangeVector(code, values) => {
-                let code_str = code.to_string();
-                if let Some(info) = signal_map.get(&code_str) {
-                    let val_str = values
-                        .iter()
-                        .map(value_to_char)
-                        .collect::<String>();
-                    if let Some(changes) = signal_changes.get_mut(&info.path) {
-                        changes.push((current_time, val_str));
-                    }
-                }
-            }
-            _ => {} // skip other commands
+            _ => {}
         }
     }
 
     let mut signals: Vec<SignalInfo> = signal_map.into_values().collect();
     signals.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let mut data: HashMap<String, SignalData> = HashMap::new();
-    for (path, mut changes) in signal_changes {
-        changes.sort_by_key(|(t, _)| *t);
-        data.insert(path, SignalData { changes });
-    }
-
     Ok(Waveform {
         timescale,
         signals,
-        data,
+        data: HashMap::new(),
         file_format: FileFormat::Vcd,
+        lazy: Some(LazyLoader::Vcd {
+            file_path: file_path.to_string(),
+            id_codes,
+        }),
     })
+}
+
+pub fn load_vcd_signal(
+    file_path: &str,
+    id_codes: &HashMap<String, String>,
+    target_path: &str,
+) -> Result<SignalData, WaveqlError> {
+    let target_id = id_codes
+        .iter()
+        .find(|(_, path)| *path == target_path)
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| WaveqlError::SignalNotFound(target_path.to_string()))?;
+
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let mut parser = vcd::Parser::new(reader);
+
+    let mut current_time: u64 = 0;
+    let mut changes: Vec<(u64, CompactValue)> = Vec::new();
+    let mut header_done = false;
+
+    loop {
+        let cmd = match parser.next() {
+            Some(Ok(cmd)) => cmd,
+            Some(Err(e)) => return Err(WaveqlError::VcdParse(format!("{e}"))),
+            None => break,
+        };
+
+        match cmd {
+            vcd::Command::Enddefinitions => {
+                header_done = true;
+            }
+            vcd::Command::Timestamp(time) if header_done => {
+                current_time = time;
+            }
+            vcd::Command::ChangeScalar(code, value) if header_done => {
+                if code.to_string() == target_id {
+                    let val_byte = match &value {
+                        vcd::Value::V0 => b'0',
+                        vcd::Value::V1 => b'1',
+                        vcd::Value::X => b'X',
+                        vcd::Value::Z => b'Z',
+                    };
+                    changes.push((current_time, CompactValue::Bit(val_byte)));
+                }
+            }
+            vcd::Command::ChangeVector(code, values) if header_done => {
+                if code.to_string() == target_id {
+                    let val_str: String = values.iter().map(value_to_char).collect();
+                    changes.push((current_time, CompactValue::new(&val_str)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(SignalData { changes })
 }
 
 fn convert_timeunit(unit: vcd::TimescaleUnit) -> TimeUnit {

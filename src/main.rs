@@ -210,11 +210,14 @@ fn run_changes(
     to: Option<&str>,
     format: OutputFormat,
 ) -> Result<String, WaveqlError> {
-    let waveform = loader::load(file)?;
+    let mut waveform = loader::load(file)?;
     let from_ts = waveql::parse_time_str(from, &waveform.timescale)?;
     let to_ts = to
         .map(|t| waveql::parse_time_str(t, &waveform.timescale))
         .transpose()?;
+
+    let resolved = waveform.resolve_signals(&signals)?;
+    waveform.load_signals(&resolved)?;
 
     let query = Query::Changes {
         signals,
@@ -235,11 +238,13 @@ fn run_edges(
     to: Option<&str>,
     format: OutputFormat,
 ) -> Result<String, WaveqlError> {
-    let waveform = loader::load(file)?;
+    let mut waveform = loader::load(file)?;
     let from_ts = waveql::parse_time_str(from, &waveform.timescale)?;
     let to_ts = to
         .map(|t| waveql::parse_time_str(t, &waveform.timescale))
         .transpose()?;
+
+    waveform.load_signal(signal)?;
 
     let query = Query::Edges {
         signal: signal.to_string(),
@@ -259,8 +264,10 @@ fn run_sample(
     at: &str,
     format: OutputFormat,
 ) -> Result<String, WaveqlError> {
-    let waveform = loader::load(file)?;
+    let mut waveform = loader::load(file)?;
     let at_ts = waveql::parse_time_str(at, &waveform.timescale)?;
+
+    waveform.load_signal(signal)?;
 
     let query = Query::Sample {
         signal: signal.to_string(),
@@ -276,11 +283,14 @@ fn run_ascii(
     from: &str,
     to: Option<&str>,
 ) -> Result<String, WaveqlError> {
-    let waveform = loader::load(file)?;
+    let mut waveform = loader::load(file)?;
     let from_ts = waveql::parse_time_str(from, &waveform.timescale)?;
     let to_ts = to
         .map(|t| waveql::parse_time_str(t, &waveform.timescale))
         .transpose()?;
+
+    let resolved = waveform.resolve_signals(&signals)?;
+    waveform.load_signals(&resolved)?;
 
     let query = Query::Ascii {
         signals,
