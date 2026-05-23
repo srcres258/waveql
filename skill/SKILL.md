@@ -1,3 +1,13 @@
+---
+name: waveql
+description: A high-performance CLI for querying VCD/FST waveform files.
+license: MIT
+compatibility: opencode
+metadata:
+  audience: maintainers
+  workflow: github
+---
+
 # WaveQL Skill
 
 ## Purpose
