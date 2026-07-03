@@ -23,6 +23,12 @@ pub enum WaveqlError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Protocol not found: {0}")]
+    ProtocolNotFound(String),
+
+    #[error("Binding error: {0}")]
+    BindingError(String),
+
     #[error("{0}")]
     Other(String),
 }

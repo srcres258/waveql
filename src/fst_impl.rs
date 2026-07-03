@@ -1,7 +1,8 @@
+use crate::backend::capabilities::BackendCapabilities;
+use crate::backend::metadata::WaveformMetadata;
+use crate::backend::types::{CompactValue, FileFormat, SignalInfo, TimeUnit, Timescale};
 use crate::error::WaveqlError;
-use crate::{
-    CompactValue, FileFormat, LazyLoader, SignalInfo, TimeUnit, Timescale, Waveform,
-};
+use crate::{LazyLoader, Waveform};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -32,12 +33,29 @@ pub fn parse_fst(file_path: &str) -> Result<Waveform, WaveqlError> {
     }
 
     signals.sort_by(|a, b| a.path.cmp(&b.path));
+    let signal_count = signals.len();
+
+    let metadata = WaveformMetadata {
+        timescale: timescale.clone(),
+        date: None,
+        version: None,
+        signal_count,
+        format: FileFormat::Fst,
+    };
+
+    let capabilities = BackendCapabilities {
+        supports_lazy_load: true,
+        supports_slice: true,
+        supports_incremental: true,
+        format: FileFormat::Fst,
+        description: "FST parser — wellen-backed with indexed random access",
+    };
 
     Ok(Waveform {
-        timescale,
+        metadata,
         signals,
         data: HashMap::new(),
-        file_format: FileFormat::Fst,
+        capabilities,
         lazy: Some(LazyLoader::Fst {
             waves: Box::new(RefCell::new(waves)),
             time_table,

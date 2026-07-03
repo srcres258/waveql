@@ -1,7 +1,10 @@
-use crate::error::WaveqlError;
-use crate::{
-    CompactValue, FileFormat, LazyLoader, SignalData, SignalInfo, Timescale, TimeUnit, Waveform,
+use crate::backend::capabilities::BackendCapabilities;
+use crate::backend::metadata::WaveformMetadata;
+use crate::backend::types::{
+    CompactValue, FileFormat, SignalData, SignalInfo, TimeUnit, Timescale,
 };
+use crate::error::WaveqlError;
+use crate::{LazyLoader, Waveform};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -59,12 +62,29 @@ pub fn parse_vcd(file_path: &str) -> Result<Waveform, WaveqlError> {
 
     let mut signals: Vec<SignalInfo> = signal_map.into_values().collect();
     signals.sort_by(|a, b| a.path.cmp(&b.path));
+    let signal_count = signals.len();
+
+    let metadata = WaveformMetadata {
+        timescale: timescale.clone(),
+        date: None,
+        version: None,
+        signal_count,
+        format: FileFormat::Vcd,
+    };
+
+    let capabilities = BackendCapabilities {
+        supports_lazy_load: true,
+        supports_slice: true,
+        supports_incremental: false,
+        format: FileFormat::Vcd,
+        description: "VCD parser — re-parses file for each signal load",
+    };
 
     Ok(Waveform {
-        timescale,
+        metadata,
         signals,
         data: HashMap::new(),
-        file_format: FileFormat::Vcd,
+        capabilities,
         lazy: Some(LazyLoader::Vcd {
             file_path: file_path.to_string(),
             id_codes,
@@ -105,22 +125,22 @@ pub fn load_vcd_signal(
             vcd::Command::Timestamp(time) if header_done => {
                 current_time = time;
             }
-            vcd::Command::ChangeScalar(code, value) if header_done => {
-                if code.to_string() == target_id {
-                    let val_byte = match &value {
-                        vcd::Value::V0 => b'0',
-                        vcd::Value::V1 => b'1',
-                        vcd::Value::X => b'X',
-                        vcd::Value::Z => b'Z',
-                    };
-                    changes.push((current_time, CompactValue::Bit(val_byte)));
-                }
+            vcd::Command::ChangeScalar(code, value)
+                if header_done && code.to_string() == target_id =>
+            {
+                let val_byte = match &value {
+                    vcd::Value::V0 => b'0',
+                    vcd::Value::V1 => b'1',
+                    vcd::Value::X => b'X',
+                    vcd::Value::Z => b'Z',
+                };
+                changes.push((current_time, CompactValue::Bit(val_byte)));
             }
-            vcd::Command::ChangeVector(code, values) if header_done => {
-                if code.to_string() == target_id {
-                    let val_str: String = values.iter().map(value_to_char).collect();
-                    changes.push((current_time, CompactValue::new(&val_str)));
-                }
+            vcd::Command::ChangeVector(code, values)
+                if header_done && code.to_string() == target_id =>
+            {
+                let val_str: String = values.iter().map(value_to_char).collect();
+                changes.push((current_time, CompactValue::new(&val_str)));
             }
             _ => {}
         }

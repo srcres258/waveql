@@ -1,16 +1,16 @@
+use crate::backend::types::FileFormat;
+use crate::backend::WaveformBackend;
 use crate::error::WaveqlError;
-use crate::{FileFormat, Waveform};
 
-/// Detect file format and load the waveform.
-pub fn load(file_path: &str) -> Result<Waveform, WaveqlError> {
+pub fn load(file_path: &str) -> Result<Box<dyn WaveformBackend>, WaveqlError> {
     let format = detect_format(file_path)?;
-    match format {
-        FileFormat::Vcd => crate::vcd_impl::parse_vcd(file_path),
-        FileFormat::Fst => crate::fst_impl::parse_fst(file_path),
-    }
+    let waveform = match format {
+        FileFormat::Vcd => crate::vcd_impl::parse_vcd(file_path)?,
+        FileFormat::Fst => crate::fst_impl::parse_fst(file_path)?,
+    };
+    Ok(Box::new(waveform))
 }
 
-/// Detect format from file extension.
 fn detect_format(file_path: &str) -> Result<FileFormat, WaveqlError> {
     let lower = file_path.to_lowercase();
     if lower.ends_with(".vcd") {
