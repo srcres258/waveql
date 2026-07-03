@@ -1,11 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process;
-use waveql::error::WaveqlError;
-use waveql::loader;
-use waveql::output;
-use waveql::query::{EdgeType, OutputFormat, Query, TimeRange};
+use waveql::planner::{
+    format_protocols_table, format_protocols_text, CommandSpec, PlanRequest, Session,
+};
+use waveql::protocol::spi::SpiAnalyzer;
+use waveql::protocol::valid_ready::ValidReadyAnalyzer;
+use waveql::protocol::ProtocolCatalog;
+use waveql::query::{EdgeType, OutputFormat};
 
-/// WaveQL — query VCD/FST waveform files like a database.
+// ── Top-level CLI ──────────────────────────────────────────────────
+
 #[derive(Parser)]
 #[command(name = "waveql", version, about)]
 struct Cli {
@@ -13,97 +17,238 @@ struct Cli {
     command: Commands,
 }
 
+// ── Subcommands ────────────────────────────────────────────────────
+
 #[derive(Subcommand)]
 enum Commands {
-    /// List all signals in a waveform file (JSON output)
-    List {
-        /// Path to waveform file (.vcd or .fst)
-        file: String,
+    // ── Responsibility-based grouped commands ──
+    /// Inspect signals: list, changes, edges, sample, ascii
+    #[command(alias = "i")]
+    Inspect {
+        #[command(subcommand)]
+        cmd: InspectCommands,
     },
 
-    /// Extract signal changes in a time range
-    Changes {
-        /// Path to waveform file
-        file: String,
+    /// Protocol discovery, binding, and analysis
+    #[command(alias = "proto")]
+    Protocol {
+        #[command(subcommand)]
+        cmd: ProtocolCommands,
+    },
 
-        /// Signals to query (comma-separated, supports * wildcard: top.*)
+    // ── Legacy flat commands (preserved for backward compatibility) ──
+    #[command(alias = "ls")]
+    List { file: String },
+
+    Changes {
+        file: String,
         #[arg(short, long, value_delimiter = ',')]
         signals: Option<Vec<String>>,
-
-        /// Start time (e.g., "0ns", "100ns")
         #[arg(long, default_value = "0ns")]
         from: String,
-
-        /// End time (e.g., "500ns", "10us")
         #[arg(long)]
         to: Option<String>,
-
-        /// Output format
         #[arg(long, default_value = "json")]
         format: FormatArg,
     },
 
-    /// Detect rising/falling edges on a signal
     Edges {
-        /// Path to waveform file
         file: String,
-
-        /// Signal to detect edges on
         #[arg(short, long)]
         signal: String,
-
-        /// Edge type: rising, falling, or both
         #[arg(short, long, default_value = "both")]
         r#type: EdgeTypeArg,
-
-        /// Start time
         #[arg(long, default_value = "0ns")]
         from: String,
-
-        /// End time
         #[arg(long)]
         to: Option<String>,
-
-        /// Output format
         #[arg(long, default_value = "json")]
         format: FormatArg,
     },
 
-    /// Sample a signal value at a specific time
     Sample {
-        /// Path to waveform file
         file: String,
-
-        /// Signal to sample
         #[arg(short, long)]
         signal: String,
-
-        /// Time to sample at (e.g., "237ns")
         #[arg(long)]
         at: String,
-
-        /// Output format
         #[arg(long, default_value = "json")]
         format: FormatArg,
     },
 
-    /// Render an ASCII waveform view (for humans)
     Ascii {
-        /// Path to waveform file
         file: String,
-
-        /// Signals to display (comma-separated, supports * wildcard)
         #[arg(short, long, value_delimiter = ',')]
         signals: Option<Vec<String>>,
-
-        /// Start time
         #[arg(long, default_value = "0ns")]
         from: String,
-
-        /// End time
         #[arg(long)]
         to: Option<String>,
     },
+
+    /// List available protocol schemas.
+    Protocols {
+        #[arg(long, default_value = "text")]
+        format: FormatArg,
+    },
+
+    /// Bind logical protocol roles to concrete signal paths.
+    Bind {
+        file: String,
+
+        /// Protocol name (e.g., "valid_ready", "spi").
+        #[arg(short, long)]
+        protocol: String,
+
+        /// Role-to-signal binding in ROLE=SIGNAL form (repeatable).
+        #[arg(short, long = "set", value_parser = parse_binding)]
+        bindings: Vec<(String, String)>,
+
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+
+    /// Run a protocol analyzer against a waveform.
+    Analyze {
+        file: String,
+
+        /// Protocol name (e.g., "valid_ready").
+        #[arg(short, long)]
+        protocol: String,
+
+        /// Role-to-signal binding in ROLE=SIGNAL form (repeatable).
+        #[arg(short, long = "set", value_parser = parse_binding)]
+        bindings: Vec<(String, String)>,
+
+        #[arg(long, default_value = "0ns")]
+        from: String,
+
+        #[arg(long)]
+        to: Option<String>,
+
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+}
+
+// ── Grouped subcommand enums ───────────────────────────────────────
+
+#[derive(Subcommand)]
+enum InspectCommands {
+    /// List all signals in the waveform file.
+    List { file: String },
+
+    /// Show value changes for signals within a time range.
+    Changes {
+        file: String,
+        #[arg(short, long, value_delimiter = ',')]
+        signals: Option<Vec<String>>,
+        #[arg(long, default_value = "0ns")]
+        from: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+
+    /// Detect rising/falling/both edges for a signal.
+    Edges {
+        file: String,
+        #[arg(short, long)]
+        signal: String,
+        #[arg(short, long, default_value = "both")]
+        r#type: EdgeTypeArg,
+        #[arg(long, default_value = "0ns")]
+        from: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+
+    /// Sample a signal at a single point in time.
+    Sample {
+        file: String,
+        #[arg(short, long)]
+        signal: String,
+        #[arg(long)]
+        at: String,
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+
+    /// Render an ASCII waveform for signals.
+    Ascii {
+        file: String,
+        #[arg(short, long, value_delimiter = ',')]
+        signals: Option<Vec<String>>,
+        #[arg(long, default_value = "0ns")]
+        from: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProtocolCommands {
+    /// List available protocol schemas.
+    List {
+        #[arg(long, default_value = "text")]
+        format: FormatArg,
+    },
+
+    /// Bind logical protocol roles to concrete signal paths.
+    Bind {
+        file: String,
+
+        /// Protocol name (e.g., "valid_ready", "spi").
+        #[arg(short, long)]
+        protocol: String,
+
+        /// Role-to-signal binding in ROLE=SIGNAL form (repeatable).
+        #[arg(short, long = "set", value_parser = parse_binding)]
+        bindings: Vec<(String, String)>,
+
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+
+    /// Run a protocol analyzer against a waveform.
+    Analyze {
+        file: String,
+
+        /// Protocol name (e.g., "valid_ready").
+        #[arg(short, long)]
+        protocol: String,
+
+        /// Role-to-signal binding in ROLE=SIGNAL form (repeatable).
+        #[arg(short, long = "set", value_parser = parse_binding)]
+        bindings: Vec<(String, String)>,
+
+        #[arg(long, default_value = "0ns")]
+        from: String,
+
+        #[arg(long)]
+        to: Option<String>,
+
+        #[arg(long, default_value = "json")]
+        format: FormatArg,
+    },
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+fn parse_binding(s: &str) -> Result<(String, String), String> {
+    if let Some((role, signal)) = s.split_once('=') {
+        let role = role.trim();
+        let signal = signal.trim();
+        if role.is_empty() || signal.is_empty() {
+            return Err("binding must be ROLE=SIGNAL (both non-empty)".into());
+        }
+        Ok((role.to_string(), signal.to_string()))
+    } else {
+        Err("binding must be ROLE=SIGNAL form".into())
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -140,54 +285,91 @@ impl From<EdgeTypeArg> for EdgeType {
     }
 }
 
+// ── Dispatch ───────────────────────────────────────────────────────
+
 fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Commands::List { file } => {
-            run_list(&file)
+    match &cli.command {
+        // ── Grouped: inspect ──
+        Commands::Inspect { cmd } => {
+            let (file, command, format) = dispatch_inspect(cmd);
+            let request = PlanRequest::new(file, command, format);
+            execute_or_exit(&request);
         }
-        Commands::Changes {
-            file,
-            signals,
-            from,
-            to,
-            format,
-        } => {
-            run_changes(&file, signals.unwrap_or_default(), &from, to.as_deref(), format.into())
-        }
-        Commands::Edges {
-            file,
-            signal,
-            r#type,
-            from,
-            to,
-            format,
-        } => {
-            run_edges(&file, &signal, r#type.into(), &from, to.as_deref(), format.into())
-        }
-        Commands::Sample {
-            file,
-            signal,
-            at,
-            format,
-        } => {
-            run_sample(&file, &signal, &at, format.into())
-        }
-        Commands::Ascii {
-            file,
-            signals,
-            from,
-            to,
-        } => {
-            run_ascii(&file, signals.unwrap_or_default(), &from, to.as_deref())
-        }
-    };
 
-    match result {
-        Ok(output) => {
-            println!("{output}");
+        // ── Grouped: protocol ──
+        Commands::Protocol { cmd } => match cmd {
+            ProtocolCommands::List { format } => {
+                let fmt: OutputFormat = format.clone().into();
+                match run_protocols(fmt) {
+                    Ok(output) => println!("{output}"),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
+            ProtocolCommands::Bind {
+                file,
+                protocol,
+                bindings,
+                format,
+            } => {
+                let request = PlanRequest::new(
+                    file.clone(),
+                    CommandSpec::Bind {
+                        protocol_name: protocol.clone(),
+                        bindings: bindings.clone(),
+                    },
+                    format.clone().into(),
+                );
+                execute_or_exit(&request);
+            }
+            ProtocolCommands::Analyze {
+                file,
+                protocol,
+                bindings,
+                from,
+                to,
+                format,
+            } => {
+                let request = PlanRequest::new(
+                    file.clone(),
+                    CommandSpec::Analyze {
+                        protocol_name: protocol.clone(),
+                        bindings: bindings.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    format.clone().into(),
+                );
+                execute_or_exit(&request);
+            }
+        },
+
+        // ── Legacy flat commands ──
+        Commands::Protocols { format } => {
+            let fmt: OutputFormat = format.clone().into();
+            match run_protocols(fmt) {
+                Ok(output) => println!("{output}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            }
         }
+        _ => {
+            let (file, command, format) = dispatch_legacy(&cli.command);
+            let request = PlanRequest::new(file, command, format);
+            execute_or_exit(&request);
+        }
+    }
+}
+
+fn execute_or_exit(request: &PlanRequest) {
+    match run(request) {
+        Ok(output) => println!("{output}"),
         Err(e) => {
             eprintln!("Error: {e}");
             process::exit(1);
@@ -195,123 +377,187 @@ fn main() {
     }
 }
 
-// ── Command runners ──────────────────────────────────────────────
+// ── Dispatch helpers ───────────────────────────────────────────────
 
-fn run_list(file: &str) -> Result<String, WaveqlError> {
-    let waveform = loader::load(file)?;
-    let query = Query::List;
-    output::json::render(&waveform, &query, file)
-}
-
-fn run_changes(
-    file: &str,
-    signals: Vec<String>,
-    from: &str,
-    to: Option<&str>,
-    format: OutputFormat,
-) -> Result<String, WaveqlError> {
-    let mut waveform = loader::load(file)?;
-    let from_ts = waveql::parse_time_str(from, &waveform.timescale)?;
-    let to_ts = to
-        .map(|t| waveql::parse_time_str(t, &waveform.timescale))
-        .transpose()?;
-
-    let resolved = waveform.resolve_signals(&signals)?;
-    waveform.load_signals(&resolved)?;
-
-    let query = Query::Changes {
-        signals,
-        range: TimeRange {
-            from: Some(from_ts),
-            to: to_ts,
-        },
-    };
-
-    render(&waveform, &query, file, format)
-}
-
-fn run_edges(
-    file: &str,
-    signal: &str,
-    edge_type: EdgeType,
-    from: &str,
-    to: Option<&str>,
-    format: OutputFormat,
-) -> Result<String, WaveqlError> {
-    let mut waveform = loader::load(file)?;
-    let from_ts = waveql::parse_time_str(from, &waveform.timescale)?;
-    let to_ts = to
-        .map(|t| waveql::parse_time_str(t, &waveform.timescale))
-        .transpose()?;
-
-    waveform.load_signal(signal)?;
-
-    let query = Query::Edges {
-        signal: signal.to_string(),
-        edge_type,
-        range: TimeRange {
-            from: Some(from_ts),
-            to: to_ts,
-        },
-    };
-
-    render(&waveform, &query, file, format)
-}
-
-fn run_sample(
-    file: &str,
-    signal: &str,
-    at: &str,
-    format: OutputFormat,
-) -> Result<String, WaveqlError> {
-    let mut waveform = loader::load(file)?;
-    let at_ts = waveql::parse_time_str(at, &waveform.timescale)?;
-
-    waveform.load_signal(signal)?;
-
-    let query = Query::Sample {
-        signal: signal.to_string(),
-        at: at_ts,
-    };
-
-    render(&waveform, &query, file, format)
-}
-
-fn run_ascii(
-    file: &str,
-    signals: Vec<String>,
-    from: &str,
-    to: Option<&str>,
-) -> Result<String, WaveqlError> {
-    let mut waveform = loader::load(file)?;
-    let from_ts = waveql::parse_time_str(from, &waveform.timescale)?;
-    let to_ts = to
-        .map(|t| waveql::parse_time_str(t, &waveform.timescale))
-        .transpose()?;
-
-    let resolved = waveform.resolve_signals(&signals)?;
-    waveform.load_signals(&resolved)?;
-
-    let query = Query::Ascii {
-        signals,
-        range: TimeRange {
-            from: Some(from_ts),
-            to: to_ts,
-        },
-    };
-
-    output::text::render(&waveform, &query)
-}
-
-fn render(
-    waveform: &waveql::Waveform,
-    query: &Query,
-    file: &str,
-    format: OutputFormat,
-) -> Result<String, WaveqlError> {
-    match format {
-        OutputFormat::Json => output::json::render(waveform, query, file),
-        OutputFormat::Text => output::text::render(waveform, query),
-        OutputFormat::Table => output::table::render(waveform, query),
+/// Convert inspect subcommand to the canonical (file, CommandSpec, OutputFormat) triplet.
+fn dispatch_inspect(cmd: &InspectCommands) -> (String, CommandSpec, OutputFormat) {
+    match cmd {
+        InspectCommands::List { file } => (file.clone(), CommandSpec::List, OutputFormat::Json),
+        InspectCommands::Changes {
+            file,
+            signals,
+            from,
+            to,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Changes {
+                signals: signals.clone().unwrap_or_default(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            format.clone().into(),
+        ),
+        InspectCommands::Edges {
+            file,
+            signal,
+            r#type,
+            from,
+            to,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Edges {
+                signal: signal.clone(),
+                edge_type: r#type.clone().into(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            format.clone().into(),
+        ),
+        InspectCommands::Sample {
+            file,
+            signal,
+            at,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Sample {
+                signal: signal.clone(),
+                at: at.clone(),
+            },
+            format.clone().into(),
+        ),
+        InspectCommands::Ascii {
+            file,
+            signals,
+            from,
+            to,
+        } => (
+            file.clone(),
+            CommandSpec::Ascii {
+                signals: signals.clone().unwrap_or_default(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            OutputFormat::Text,
+        ),
     }
+}
+
+/// Convert legacy flat command to the canonical (file, CommandSpec, OutputFormat) triplet.
+fn dispatch_legacy(cmd: &Commands) -> (String, CommandSpec, OutputFormat) {
+    match cmd {
+        Commands::List { file } => (file.clone(), CommandSpec::List, OutputFormat::Json),
+        Commands::Changes {
+            file,
+            signals,
+            from,
+            to,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Changes {
+                signals: signals.clone().unwrap_or_default(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            format.clone().into(),
+        ),
+        Commands::Edges {
+            file,
+            signal,
+            r#type,
+            from,
+            to,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Edges {
+                signal: signal.clone(),
+                edge_type: r#type.clone().into(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            format.clone().into(),
+        ),
+        Commands::Sample {
+            file,
+            signal,
+            at,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Sample {
+                signal: signal.clone(),
+                at: at.clone(),
+            },
+            format.clone().into(),
+        ),
+        Commands::Ascii {
+            file,
+            signals,
+            from,
+            to,
+        } => (
+            file.clone(),
+            CommandSpec::Ascii {
+                signals: signals.clone().unwrap_or_default(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            OutputFormat::Text,
+        ),
+        Commands::Bind {
+            file,
+            protocol,
+            bindings,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Bind {
+                protocol_name: protocol.clone(),
+                bindings: bindings.clone(),
+            },
+            format.clone().into(),
+        ),
+        Commands::Analyze {
+            file,
+            protocol,
+            bindings,
+            from,
+            to,
+            format,
+        } => (
+            file.clone(),
+            CommandSpec::Analyze {
+                protocol_name: protocol.clone(),
+                bindings: bindings.clone(),
+                from: from.clone(),
+                to: to.clone(),
+            },
+            format.clone().into(),
+        ),
+        Commands::Protocols { .. } | Commands::Inspect { .. } | Commands::Protocol { .. } => {
+            unreachable!()
+        }
+    }
+}
+
+fn run_protocols(format: OutputFormat) -> Result<String, waveql::error::WaveqlError> {
+    let mut catalog = ProtocolCatalog::new();
+    catalog.register(Box::new(ValidReadyAnalyzer::new()));
+    catalog.register(Box::new(SpiAnalyzer::new()));
+    let output = waveql::evaluator::evaluate_protocols(&catalog)?;
+    match format {
+        OutputFormat::Json => Ok(serde_json::to_string_pretty(&output)?),
+        OutputFormat::Text => format_protocols_text(&output),
+        OutputFormat::Table => format_protocols_table(&output),
+    }
+}
+
+fn run(request: &PlanRequest) -> Result<String, waveql::error::WaveqlError> {
+    let mut session = Session::open(&request.file)?;
+    let plan = session.plan(request)?;
+    session.execute(&plan, request.format)
 }
