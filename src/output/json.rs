@@ -1,11 +1,16 @@
+use crate::backend::WaveformBackend;
 use crate::error::WaveqlError;
-use crate::{Query, Waveform};
+use crate::report::Report;
+use crate::Query;
 
-/// Render query result as JSON string.
 pub fn render(
-    waveform: &Waveform,
+    waveform: &dyn WaveformBackend,
     query: &Query,
     file_name: &str,
 ) -> Result<String, WaveqlError> {
-    crate::evaluator::evaluate(waveform, query, file_name)
+    let report = crate::evaluator::evaluate(waveform, query, file_name)?;
+    match &report {
+        Report::Ascii(s) => Ok(s.clone()),
+        _ => Ok(serde_json::to_string_pretty(&report)?),
+    }
 }

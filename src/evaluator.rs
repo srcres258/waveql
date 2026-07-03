@@ -1,15 +1,20 @@
+use crate::backend::WaveformBackend;
 use crate::error::WaveqlError;
+use crate::events::{derive_events, DerivationRequest, DerivedEvent, EdgePolarity};
+use crate::protocol::ProtocolCatalog;
 use crate::query::{
-    ChangeEvent, ChangesOutput, EdgesOutput, EdgeType, ListOutput, RangeInfo, SampleOutput,
+    ChangeEvent, ChangesOutput, DerivationKind, DerivedEventOutput, EdgeType, EdgesOutput,
+    EventsOutput, ListOutput, ProtocolSchemaInfo, ProtocolsOutput, RangeInfo, SampleOutput,
 };
-use crate::{CompactValue, Query, Waveform};
+use crate::report::Report;
+use crate::trace::{TimeBound, TraceSliceRequest};
+use crate::Query;
 
-/// Evaluate a query against a loaded waveform.
 pub fn evaluate(
-    waveform: &Waveform,
+    waveform: &dyn WaveformBackend,
     query: &Query,
     file_name: &str,
-) -> Result<String, WaveqlError> {
+) -> Result<Report, WaveqlError> {
     match query {
         Query::List => evaluate_list(waveform, file_name),
         Query::Changes { signals, range } => evaluate_changes(waveform, signals, *range),
@@ -20,74 +25,83 @@ pub fn evaluate(
         } => evaluate_edges(waveform, signal, *edge_type, *range),
         Query::Sample { signal, at } => evaluate_sample(waveform, signal, *at),
         Query::Ascii { signals, range } => evaluate_ascii(waveform, signals, *range),
+        Query::Events { derivation, range } => evaluate_events(waveform, derivation, *range),
+        Query::Protocols => Err(WaveqlError::Other(
+            "Protocols query must be handled by Session, not evaluator".into(),
+        )),
+        Query::Bind(_) => Err(WaveqlError::Other(
+            "Bind query must be handled by Session, not evaluator".into(),
+        )),
+        Query::Analyze(_) => Err(WaveqlError::Other(
+            "Analyze query must be handled by Session, not evaluator".into(),
+        )),
     }
 }
 
-fn evaluate_list(waveform: &Waveform, file_name: &str) -> Result<String, WaveqlError> {
-    let output = ListOutput {
+fn evaluate_list(waveform: &dyn WaveformBackend, file_name: &str) -> Result<Report, WaveqlError> {
+    let metadata = waveform.metadata();
+    let signals: Vec<crate::backend::types::SignalInfo> = waveform.signal_iter().cloned().collect();
+    Ok(Report::List(ListOutput {
         file: file_name.to_string(),
-        format: waveform.file_format.to_string(),
-        timescale: waveform.timescale.to_string(),
-        total_signals: waveform.signals.len(),
-        signals: waveform.signals.clone(),
-    };
-    Ok(serde_json::to_string_pretty(&output)?)
+        format: metadata.format.to_string(),
+        timescale: metadata.timescale.to_string(),
+        total_signals: metadata.signal_count,
+        signals,
+    }))
 }
 
 fn evaluate_changes(
-    waveform: &Waveform,
+    waveform: &dyn WaveformBackend,
     signals: &[String],
     range: crate::query::TimeRange,
-) -> Result<String, WaveqlError> {
-    let resolved = waveform.resolve_signals(signals)?;
-    let mut events: Vec<ChangeEvent> = Vec::new();
-
+) -> Result<Report, WaveqlError> {
     let from = range.from.unwrap_or(0);
     let to = range.to.unwrap_or(u64::MAX);
+    let bounds = TimeBound::new(from, to)?;
 
-    for sig in &resolved {
-        if let Some(data) = waveform.data.get(sig) {
-            for (t, v) in &data.changes {
-                if *t >= from && *t <= to {
-                    events.push(ChangeEvent {
-                        time: *t,
-                        signal: sig.clone(),
-                        value: v.as_str().to_string(),
-                    });
-                }
-            }
-        }
-    }
+    let request = TraceSliceRequest::new(waveform, signals.to_vec(), bounds);
+    let slice = request.build()?;
+
+    let resolved_count = slice.signal_count();
+
+    let mut events: Vec<ChangeEvent> = slice
+        .event_cursor()
+        .map(|ev| ChangeEvent {
+            time: ev.time,
+            signal: ev.signal,
+            value: ev.value,
+        })
+        .collect();
 
     events.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.signal.cmp(&b.signal)));
 
-    let output = ChangesOutput {
+    Ok(Report::Changes(ChangesOutput {
         query_type: "changes".into(),
-        signal_count: resolved.len(),
+        signal_count: resolved_count,
         range: RangeInfo {
             from: range.from,
             to: range.to,
         },
         events,
-    };
-    Ok(serde_json::to_string_pretty(&output)?)
+    }))
 }
 
 fn evaluate_edges(
-    waveform: &Waveform,
+    waveform: &dyn WaveformBackend,
     signal: &str,
     edge_type: EdgeType,
     range: crate::query::TimeRange,
-) -> Result<String, WaveqlError> {
-    let data = waveform
-        .data
-        .get(signal)
-        .ok_or_else(|| WaveqlError::SignalNotFound(signal.to_string()))?;
-
+) -> Result<Report, WaveqlError> {
     let from = range.from.unwrap_or(0);
     let to = range.to.unwrap_or(u64::MAX);
+    let bounds = TimeBound::new(from, to)?;
 
-    let filtered: Vec<&(u64, CompactValue)> = data
+    let request = TraceSliceRequest::new(waveform, vec![signal.to_string()], bounds);
+    let slice = request.build()?;
+
+    let data = slice.data.first().expect("slice has at least one signal");
+
+    let filtered: Vec<&(u64, crate::backend::types::CompactValue)> = data
         .changes
         .iter()
         .skip_while(|(t, _)| *t < from)
@@ -129,63 +143,47 @@ fn evaluate_edges(
         EdgeType::Both => "both",
     };
 
-    let output = EdgesOutput {
+    Ok(Report::Edges(EdgesOutput {
         signal: signal.to_string(),
         edge_type: edge_type_str.to_string(),
         edge_count: edges.len(),
         edges,
-    };
-    Ok(serde_json::to_string_pretty(&output)?)
+    }))
 }
 
 fn evaluate_sample(
-    waveform: &Waveform,
+    waveform: &dyn WaveformBackend,
     signal: &str,
     at: u64,
-) -> Result<String, WaveqlError> {
-    let data = waveform
-        .data
-        .get(signal)
-        .ok_or_else(|| WaveqlError::SignalNotFound(signal.to_string()))?;
+) -> Result<Report, WaveqlError> {
+    let data = waveform.signal_data(signal)?;
 
     let value = data.sample(at).map(|cv| cv.as_str().to_string());
 
-    let output = SampleOutput {
+    Ok(Report::Sample(SampleOutput {
         signal: signal.to_string(),
         at,
         value,
-    };
-    Ok(serde_json::to_string_pretty(&output)?)
+    }))
 }
 
 fn evaluate_ascii(
-    waveform: &Waveform,
+    waveform: &dyn WaveformBackend,
     signals: &[String],
     range: crate::query::TimeRange,
-) -> Result<String, WaveqlError> {
-    let resolved = waveform.resolve_signals(signals)?;
-
+) -> Result<Report, WaveqlError> {
     let from = range.from.unwrap_or(0);
     let to = range.to.unwrap_or(u64::MAX);
+    let bounds = TimeBound::new(from, to)?;
 
-    // Collect time points: all unique times in range from resolved signals
-    let mut time_points: Vec<u64> = Vec::new();
-    for sig in &resolved {
-        if let Some(data) = waveform.data.get(sig) {
-            for (t, _) in &data.changes {
-                if *t >= from && *t <= to {
-                    time_points.push(*t);
-                }
-            }
-        }
-    }
-    time_points.sort();
-    time_points.dedup();
+    let request = TraceSliceRequest::new(waveform, signals.to_vec(), bounds);
+    let slice = request.build()?;
 
-    // Build ASCII table
+    let resolved = &slice.signals;
+    let time_points = slice.unique_time_points();
+
     let mut output = String::new();
 
-    // Header
     output.push_str(&format!(
         "{:<10} | {}\n",
         "Time",
@@ -205,16 +203,14 @@ fn evaluate_ascii(
             .join("-+-")
     ));
 
-    // Data rows
     for &t in &time_points {
-        let time_str = waveform.timescale.format_time(t);
+        let time_str = waveform.timescale().format_time(t);
         let values: Vec<String> = resolved
             .iter()
-            .map(|sig| {
-                waveform
-                    .data
-                    .get(sig)
-                    .and_then(|d| d.sample(t))
+            .enumerate()
+            .map(|(i, _sig)| {
+                slice
+                    .sample(i, t)
                     .map(|v| v.format_ascii())
                     .unwrap_or_else(|| "??".to_string())
             })
@@ -226,17 +222,180 @@ fn evaluate_ascii(
             values
                 .iter()
                 .enumerate()
-                .map(|(i, v)| format!(
-                    "{:>width$}",
-                    v,
-                    width = resolved[i].len().max(4)
-                ))
+                .map(|(i, v)| format!("{:>width$}", v, width = resolved[i].len().max(4)))
                 .collect::<Vec<_>>()
                 .join(" | ")
         ));
     }
 
-    Ok(output)
+    Ok(Report::Ascii(output))
 }
 
+fn evaluate_events(
+    waveform: &dyn WaveformBackend,
+    derivation: &DerivationKind,
+    range: crate::query::TimeRange,
+) -> Result<Report, WaveqlError> {
+    let from = range.from.unwrap_or(0);
+    let to = range.to.unwrap_or(u64::MAX);
+    let bounds = TimeBound::new(from, to)?;
 
+    let (signals, request, derivation_name) = match derivation {
+        DerivationKind::Edges { signals, polarity } => {
+            let pol = match polarity {
+                crate::query::EdgePolarity::Rise => EdgePolarity::Rise,
+                crate::query::EdgePolarity::Fall => EdgePolarity::Fall,
+                crate::query::EdgePolarity::Toggle => EdgePolarity::Toggle,
+            };
+            (
+                signals.clone(),
+                DerivationRequest::Edges {
+                    signals: signals.clone(),
+                    polarity: pol,
+                },
+                "edges",
+            )
+        }
+        DerivationKind::Handshake { signal_a, signal_b } => (
+            vec![signal_a.clone(), signal_b.clone()],
+            DerivationRequest::Handshake {
+                signal_a: signal_a.clone(),
+                signal_b: signal_b.clone(),
+            },
+            "handshake",
+        ),
+        DerivationKind::Stalls {
+            signals,
+            min_duration,
+        } => (
+            signals.clone(),
+            DerivationRequest::Stalls {
+                signals: signals.clone(),
+                min_duration: *min_duration,
+            },
+            "stalls",
+        ),
+        DerivationKind::StateTransitions { signal } => (
+            vec![signal.clone()],
+            DerivationRequest::StateTransitions {
+                signal: signal.clone(),
+            },
+            "state_transitions",
+        ),
+    };
+
+    let slice_request = TraceSliceRequest::new(waveform, signals, bounds);
+    let slice = slice_request.build()?;
+
+    let derived = derive_events(&slice, &request);
+
+    let event_outputs: Vec<DerivedEventOutput> = derived
+        .iter()
+        .map(|ev| match ev {
+            DerivedEvent::Edge {
+                time,
+                signal,
+                polarity,
+                prev_value,
+                next_value,
+                ..
+            } => DerivedEventOutput::Edge {
+                time: *time,
+                signal: signal.clone(),
+                polarity: format!("{:?}", polarity).to_lowercase(),
+                prev_value: prev_value.clone(),
+                next_value: next_value.clone(),
+            },
+            DerivedEvent::Handshake {
+                time,
+                phase,
+                signal_a,
+                signal_b,
+                ..
+            } => DerivedEventOutput::Handshake {
+                time: *time,
+                phase: format!("{:?}", phase).to_lowercase(),
+                signal_a: signal_a.clone(),
+                signal_b: signal_b.clone(),
+            },
+            DerivedEvent::Stall {
+                signal,
+                value,
+                since_time,
+                duration,
+                ..
+            } => DerivedEventOutput::Stall {
+                signal: signal.clone(),
+                value: value.clone(),
+                since_time: *since_time,
+                duration: *duration,
+            },
+            DerivedEvent::Timeout {
+                description,
+                deadline,
+                last_event_time,
+                signal,
+                ..
+            } => DerivedEventOutput::Timeout {
+                description: description.clone(),
+                deadline: *deadline,
+                last_event_time: *last_event_time,
+                signal: signal.clone(),
+            },
+            DerivedEvent::StateTransition {
+                time,
+                signal,
+                from_value,
+                to_value,
+                ..
+            } => DerivedEventOutput::StateTransition {
+                time: *time,
+                signal: signal.clone(),
+                from: from_value.clone(),
+                to: to_value.clone(),
+            },
+            DerivedEvent::SampleOnEdge {
+                time,
+                clock,
+                target,
+                target_value,
+                edge_polarity,
+                ..
+            } => DerivedEventOutput::SampleOnEdge {
+                time: *time,
+                clock: clock.clone(),
+                target: target.clone(),
+                value: target_value.clone(),
+                edge: format!("{:?}", edge_polarity).to_lowercase(),
+            },
+        })
+        .collect();
+
+    Ok(Report::Events(EventsOutput {
+        query_type: "events".into(),
+        derivation: derivation_name.into(),
+        event_count: event_outputs.len(),
+        range: RangeInfo {
+            from: range.from,
+            to: range.to,
+        },
+        events: event_outputs,
+    }))
+}
+
+pub fn evaluate_protocols(catalog: &ProtocolCatalog) -> Result<ProtocolsOutput, WaveqlError> {
+    let meta = catalog.discovery_metadata();
+    Ok(ProtocolsOutput {
+        protocols: meta
+            .iter()
+            .map(|m| ProtocolSchemaInfo {
+                name: m.name.clone(),
+                description: m.description.clone(),
+                required_role_count: m.required_role_count,
+                optional_role_count: m.optional_role_count,
+                required_roles: m.required_roles.clone(),
+                optional_roles: m.optional_roles.clone(),
+            })
+            .collect(),
+    })
+}
