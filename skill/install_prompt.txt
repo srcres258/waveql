@@ -1,20 +1,45 @@
 You are now equipped with a new tool: **WaveQL**.
 
-WaveQL is a CLI that lets you query VCD and FST waveform files.
+WaveQL analyzes **VCD/FST hardware waveforms**. Use it to understand **hardware behavior and protocol correctness**, not just signal toggles.
 
-Your capabilities include:
-- Listing all signals in a waveform
-- Extracting signal changes over time
-- Detecting rising/falling edges
-- Sampling signal values at precise times
-- Producing both JSON (for reasoning) and ASCII (for humans)
+Default mindset:
+1. identify the behavior you want to verify,
+2. bind signals to semantic roles,
+3. ask WaveQL for protocol evidence,
+4. only then inspect raw edges/samples for proof.
 
-Always prefer JSON output when analyzing correctness.
-Use ASCII output only to confirm visually.
+### Command families
 
-Before debugging:
-1. Run `waveql list <waveform>`
-2. Identify clocks and control signals
-3. Use `sample`, `edges`, and `changes` to verify behavior
+**Raw inspection**
+- `waveql inspect list <file>` — discover signals
+- `waveql inspect changes <file> -s <signals> --from <time> --to <time> --format json` — value changes over time
+- `waveql inspect edges <file> -s <signal> -t rising|falling|both --from <time> --to <time> --format json` — edge timing
+- `waveql inspect sample <file> -s <signal> --at <time> --format json` — value at a point in time
+- `waveql inspect ascii <file> -s <signals> --from <time> --to <time>` — human waveform view
 
-If the waveform shows unexpected behavior, explain why and suggest HDL fixes.
+**Protocol analysis**
+- `waveql protocol list --format text|json|table` — list available analyzers
+- `waveql protocol bind <file> -p <protocol> -b ROLE=SIGNAL -b ROLE=SIGNAL --format json` — bind protocol roles to concrete signals
+- `waveql protocol analyze <file> -p <protocol> -b ROLE=SIGNAL -b ROLE=SIGNAL --from <time> --to <time> --format json` — run semantic analysis
+
+### Output guidance
+- Prefer `--format json` when reasoning.
+- Use `text` or `table` for human review.
+- Use `ascii` only for final visual confirmation.
+
+### Debugging workflow
+1. Run `waveql inspect list <waveform>`.
+2. Identify clocks, resets, enables, valid/ready pairs, and other protocol roles.
+3. Bind the roles with `waveql protocol bind`.
+4. Run `waveql protocol analyze` on a tight time window.
+5. Read the result as behavior: handshake completion, stalls, payload stability, transaction completion, or protocol violations.
+6. Re-check suspicious windows with `changes`, `edges`, and `sample`.
+
+### What to optimize for
+Prefer conclusions like:
+- “the handshake stalled”
+- “data changed before acceptance”
+- “the transaction truncated early”
+- “reset release happened in the wrong order”
+
+Avoid stopping at raw statements like “the signal rose” unless that edge is the actual bug evidence.
