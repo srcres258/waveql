@@ -2,16 +2,15 @@
 
 A high-performance CLI for querying VCD/FST waveform files.
 
-Designed for AI Agents (DeepSeek / Claude / GPT) and human engineers alike.
+Designed for AI agents and RTL engineers alike.
 
 ## Features
 
-- **VCD** and **FST** waveform support (via `vcd` and `wellen` crates)
-- **JSON output** for Agent reasoning
-- **ASCII waveform** rendering for human visual inspection
-- **Table output** for CSV/piped workflows
-- Wildcard signal matching (`top.*`)
-- Edge detection (rising/falling/both)
+- **Raw inspection** via `inspect` for signal lists, changes, edges, samples, and ASCII slices
+- **Protocol analysis** via `protocol` for schema discovery, role binding, and semantic checks
+- Built-in analyzers for **valid/ready** and **SPI** handshakes
+- **Wildcard signal matching** (`top.*`) with a searchable signal index
+- **JSON / text / table** output for machine and human workflows
 - Time-based sampling and range queries
 - Zero C dependencies, fully cross-platform
 
@@ -23,29 +22,24 @@ cargo install --path .
 
 ## Usage
 
-### List signals
+### Inspect signals
 ```bash
-waveql list my_waveform.vcd
+waveql inspect list my_waveform.vcd
 ```
 
-### Extract changes
+### Analyze protocol behavior
+```bash
+waveql protocol analyze my_waveform.vcd --protocol valid_ready --set valid=top.valid --set ready=top.ready
+```
+
+### Legacy flat commands still work
 ```bash
 waveql changes my_waveform.fst --signals top.clk,top.data --from 0ns --to 500ns --format json
 ```
 
-### Detect edges
-```bash
-waveql edges my_waveform.vcd --signal top.clk --type rising
-```
-
-### Sample at time
-```bash
-waveql sample my_waveform.fst --signal top.data --at 237ns
-```
-
 ### ASCII waveform
 ```bash
-waveql ascii my_waveform.vcd --signals top.clk,top.en --from 0ns --to 100ns
+waveql inspect ascii my_waveform.vcd --signals top.clk,top.en --from 0ns --to 100ns
 ```
 
 ## Output Formats
