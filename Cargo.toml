@@ -1,6 +1,6 @@
 [package]
 name = "waveql"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A high-performance VCD/FST waveform query CLI for AI Agents and humans"
 license = "MIT"
